@@ -24,9 +24,13 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      # 3. Maven 打包
+      # 3. Maven 打包并获取 JAR 文件名
       - name: Build with Maven
-        run: mvn clean package -DskipTests
+        run: |
+          mvn clean package -DskipTests
+          # 查找生成的 JAR 文件名，并保存为环境变量供后续步骤使用
+          JAR_FILE=$(ls -t target/*.jar | grep -v 'original' | head -n 1)
+          echo "APP_JAR_FILE=$JAR_FILE" >> $GITHUB_ENV
 
       # 4. 测试 SSH 连接并准备目录
       - name: Test SSH Connection & Prepare Dir
@@ -39,25 +43,32 @@ jobs:
           script: |
             echo "✅ SSH Connection Success!"
             echo "Server Path: ${{ secrets.SERVER_DEPLOY_PATH }}"
-            # 确保目录存在
+            # 确保上传临时目录存在
             mkdir -p ${{ secrets.SERVER_DEPLOY_PATH }}/temp
-            # 赋予权限 (视情况而定，如果是 root 用户可能不需要 777)
+            # 赋予权限
             chmod -R 755 ${{ secrets.SERVER_DEPLOY_PATH }}
 
-      # 5. 上传 JAR 包 (使用原生 scp)
-      - name: Upload JAR via SSH
+      # 5. ⭐️ 性能优化：压缩和上传归档文件 (解决上传慢的问题)
+      - name: Compress and Upload Archive via SSH
         run: |
+          ARCHIVE_NAME="app.tar.gz"
+          
+          echo "📦 Compressing JAR file: ${{ env.APP_JAR_FILE }} into $ARCHIVE_NAME"
+          # 使用 tar -czf 将 JAR 包压缩成 app.tar.gz
+          tar -czf $ARCHIVE_NAME ${{ env.APP_JAR_FILE }}
+          
           echo "📝 Creating temporary SSH key..."
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/id_rsa_github
           chmod 600 /tmp/id_rsa_github
           
-          echo "🚀 Uploading JAR to server..."
-          scp -i /tmp/id_rsa_github -o StrictHostKeyChecking=no target/*.jar ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/temp/
+          echo "🚀 Uploading compressed archive ($ARCHIVE_NAME) to server..."
+          # 上传压缩包
+          scp -i /tmp/id_rsa_github -o StrictHostKeyChecking=no $ARCHIVE_NAME ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/temp/
           
           echo "🧹 Cleaning up temporary key..."
           rm /tmp/id_rsa_github
 
-      # 6. 远程部署 (停止旧服务 -> 移动新包 -> 启动 -> 验证)
+      # 6. 远程部署 (解压 -> 停止旧服务 -> 启动新服务)
       - name: Deploy Service
         uses: appleboy/ssh-action@master
         with:
@@ -67,16 +78,37 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             # === 配置变量 ===
-            APP_NAME="ClineSyncBackground.jar"
+            FINAL_APP_NAME="ClineSyncBackground.jar" # 远程服务器上最终运行的文件名
             DEPLOY_PATH="${{ secrets.SERVER_DEPLOY_PATH }}"
             LOG_FILE="$DEPLOY_PATH/app.log"
+            TEMP_ARCHIVE="$DEPLOY_PATH/temp/app.tar.gz"
 
             echo "📂 Navigate to: $DEPLOY_PATH"
             cd $DEPLOY_PATH
 
-            # === 1. 停止旧服务 (优化版) ===
+            # === 1. 解压和替换文件 ===
+            echo "📦 Unpacking and replacing files..."
+            if [ -f "$TEMP_ARCHIVE" ]; then
+              # 解压文件到当前目录 (会创建 target/ 目录)
+              tar -xzf $TEMP_ARCHIVE -C ./
+            
+              # 找到解压出的新 JAR 包名 (通常在 target/ 目录下)
+              NEW_JAR_NAME=$(ls -t target/*.jar | grep -v 'original' | head -n 1)
+            
+              # 重命名为最终的服务名
+              mv -f "$NEW_JAR_NAME" "$DEPLOY_PATH/$FINAL_APP_NAME"
+            
+              # 清理临时文件和目录
+              rm -f $TEMP_ARCHIVE
+              rm -rf target/ # 清理解压后产生的 target 目录
+            else
+              echo "❌ Error: Compressed archive not found in temp directory!"
+              exit 1
+            fi
+
+            # === 2. 停止旧服务 (稳健检查) ===
             echo "🛑 Checking for existing process..."
-            PID=$(ps -ef | grep "$APP_NAME" | grep -v grep | awk '{print $2}')
+            PID=$(ps -ef | grep "$FINAL_APP_NAME" | grep -v grep | awk '{print $2}')
             
             if [ -n "$PID" ]; then
               echo "Process found (PID: $PID). Stopping..."
@@ -92,7 +124,7 @@ jobs:
                 sleep 1
               done
             
-              # 如果还在运行，强制杀死
+              # 如果 20 秒后还在运行，强制杀死
               if ps -p $PID > /dev/null; then
                 echo "⚠️ Force killing process..."
                 kill -9 $PID
@@ -101,26 +133,16 @@ jobs:
               echo "✅ No running process found."
             fi
 
-            # === 2. 移动新 JAR 包 ===
-            echo "📦 Moving new JAR file..."
-            # 强制覆盖旧文件
-            if ls $DEPLOY_PATH/temp/*.jar 1> /dev/null 2>&1; then
-                mv -f $DEPLOY_PATH/temp/*.jar $DEPLOY_PATH/$APP_NAME
-            else
-                echo "❌ Error: No JAR file found in temp directory!"
-                exit 1
-            fi
-
             # === 3. 启动新服务 ===
             echo "🚀 Starting new application..."
             # 使用 nohup 后台启动
-            nohup java -jar $DEPLOY_PATH/$APP_NAME > $LOG_FILE 2>&1 &
+            nohup java -jar $DEPLOY_PATH/$FINAL_APP_NAME > $LOG_FILE 2>&1 &
 
             # === 4. 健康检查 ===
             echo "🏥 Health checking..."
             sleep 10  # 等待 Spring Boot 初始化
             
-            NEW_PID=$(ps -ef | grep "$APP_NAME" | grep -v grep | awk '{print $2}')
+            NEW_PID=$(ps -ef | grep "$FINAL_APP_NAME" | grep -v grep | awk '{print $2}')
             
             if [ -n "$NEW_PID" ]; then
               echo "✅ Deployment Successful! Process ID: $NEW_PID"
