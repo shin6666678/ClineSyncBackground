@@ -9,7 +9,7 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # 设置超时时间，避免无限等待
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -20,66 +20,76 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: maven
+          cache: maven  # 缓存Maven依赖，加速构建
 
       - name: Build with Maven
         run: mvn clean package -DskipTests
-        # 捕获构建失败，避免后续步骤无效执行
-        continue-on-error: false
+        continue-on-error: false  # 构建失败直接终止
 
-      # 第一步：先在服务器创建目录（避免上传时目录不存在）
-      - name: Prepare Server Directory
+      # 第一步：在服务器初始化目录（确保权限）
+      - name: Prepare Server Env
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.SSH_HOST }}
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          strict_host_key_checking: false  # 跳过主机密钥验证
           script: |
-            mkdir -p ${{ secrets.SERVER_DEPLOY_PATH }}
+            # 创建部署目录（不存在则创建）
             mkdir -p ${{ secrets.SERVER_DEPLOY_PATH }}/temp
-            # 确保目录权限足够
-            chmod -R 755 ${{ secrets.SERVER_DEPLOY_PATH }}
+            # 设置目录权限（避免权限不足）
+            chmod -R 777 ${{ secrets.SERVER_DEPLOY_PATH }}
 
-      # 第二步：上传JAR包（改用更稳定的rsync）
-      - name: Upload JAR to Server
-        uses: burnett01/rsync-deployments@6.0.0
-        with:
-          switches: -avz --progress  # 显示传输进度
-          path: target/*.jar
-          remote_path: ${{ secrets.SERVER_DEPLOY_PATH }}/temp/
-          remote_host: ${{ secrets.SSH_HOST }}
-          remote_user: ${{ secrets.SSH_USERNAME }}
-          remote_port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      # 第三步：部署并启动服务
-      - name: Deploy and Start Service
+      # 第二步：用SFTP传输JAR包（替代scp/rsync，更稳定）
+      - name: Upload JAR via SFTP
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.SSH_HOST }}
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          strict_host_key_checking: false
+          script: |
+            # 通过SFTP上传JAR包到服务器临时目录
+            sftp -o StrictHostKeyChecking=no ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/temp/ <<EOF
+            put target/*.jar
+            EOF
+
+      # 第三步：部署+启动服务（包含健康检查）
+      - name: Deploy & Start Service
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          strict_host_key_checking: false
           script: |
             # 停止旧服务（优雅停止，避免强制kill）
-            PID=$(ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep | awk '{print $2}')
-            if [ -n "$PID" ]; then
-              kill $PID || true  # 允许kill失败（比如进程已退出）
+            OLD_PID=$(ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep | awk '{print $2}')
+            if [ -n "$OLD_PID" ]; then
+              kill $OLD_PID || true
               sleep 3  # 等待进程退出
             fi
-            # 移动JAR包（覆盖旧包）
+
+            # 移动JAR包到部署目录（覆盖旧包）
             mv -f ${{ secrets.SERVER_DEPLOY_PATH }}/temp/*.jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar
-            # 启动新服务（指定JVM参数，优化性能）
-            nohup java -Xms512m -Xmx1024m -jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar > ${{ secrets.SERVER_DEPLOY_PATH }}/app.log 2>&1 &
+
+            # 启动新服务（配置JVM参数，输出日志）
+            nohup java -Xms512m -Xmx1024m -jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar \
+            > ${{ secrets.SERVER_DEPLOY_PATH }}/app.log 2>&1 &
+
             # 清理临时目录
             rm -rf ${{ secrets.SERVER_DEPLOY_PATH }}/temp
-            # 验证服务是否启动
+
+            # 健康检查：等待5秒后验证服务是否启动
             sleep 5
-            if ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep; then
-              echo "Service started successfully!"
-            else
-              echo "Service start failed! Check logs:"
+            NEW_PID=$(ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep | awk '{print $2}')
+            if [ -z "$NEW_PID" ]; then
+              echo "❌ Service start failed! Logs:"
               cat ${{ secrets.SERVER_DEPLOY_PATH }}/app.log
-              exit 1  # 标记部署失败
+              exit 1
+            else
+              echo "✅ Service started successfully! PID: $NEW_PID"
             fi
