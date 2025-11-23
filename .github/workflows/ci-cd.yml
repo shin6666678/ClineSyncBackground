@@ -20,76 +20,54 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: maven  # 缓存Maven依赖，加速构建
+          cache: maven
 
       - name: Build with Maven
         run: mvn clean package -DskipTests
-        continue-on-error: false  # 构建失败直接终止
 
-      # 第一步：在服务器初始化目录（确保权限）
-      - name: Prepare Server Env
+      # 测试SSH连接（关键：先验证连接）
+      - name: Test SSH Connection
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.SSH_HOST }}
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          strict_host_key_checking: false  # 跳过主机密钥验证
           script: |
-            # 创建部署目录（不存在则创建）
+            echo "✅ SSH Connection Success!"
+            echo "Server Path: ${{ secrets.SERVER_DEPLOY_PATH }}"
             mkdir -p ${{ secrets.SERVER_DEPLOY_PATH }}/temp
-            # 设置目录权限（避免权限不足）
             chmod -R 777 ${{ secrets.SERVER_DEPLOY_PATH }}
 
-      # 第二步：用SFTP传输JAR包（替代scp/rsync，更稳定）
-      - name: Upload JAR via SFTP
+      # 用SSH原生命令传输JAR包（替代第三方Action）
+      - name: Upload JAR via SSH
+        run: |
+          # 将私钥写入临时文件
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/id_rsa_github
+          chmod 600 /tmp/id_rsa_github
+          # 用scp传输（指定私钥文件）
+          scp -i /tmp/id_rsa_github -o StrictHostKeyChecking=no target/*.jar ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/temp/
+
+      # 部署服务
+      - name: Deploy Service
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.SSH_HOST }}
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          strict_host_key_checking: false
           script: |
-            # 通过SFTP上传JAR包到服务器临时目录
-            sftp -o StrictHostKeyChecking=no ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/temp/ <<EOF
-            put target/*.jar
-            EOF
-
-      # 第三步：部署+启动服务（包含健康检查）
-      - name: Deploy & Start Service
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          port: ${{ secrets.SSH_PORT }}
-          username: ${{ secrets.SSH_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          strict_host_key_checking: false
-          script: |
-            # 停止旧服务（优雅停止，避免强制kill）
-            OLD_PID=$(ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep | awk '{print $2}')
-            if [ -n "$OLD_PID" ]; then
-              kill $OLD_PID || true
-              sleep 3  # 等待进程退出
-            fi
-
-            # 移动JAR包到部署目录（覆盖旧包）
+            # 停止旧服务
+            PID=$(ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep | awk '{print $2}')
+            if [ -n "$PID" ]; then kill $PID || true; sleep 3; fi
+            # 启动新服务
             mv -f ${{ secrets.SERVER_DEPLOY_PATH }}/temp/*.jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar
-
-            # 启动新服务（配置JVM参数，输出日志）
-            nohup java -Xms512m -Xmx1024m -jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar \
-            > ${{ secrets.SERVER_DEPLOY_PATH }}/app.log 2>&1 &
-
-            # 清理临时目录
-            rm -rf ${{ secrets.SERVER_DEPLOY_PATH }}/temp
-
-            # 健康检查：等待5秒后验证服务是否启动
+            nohup java -jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar > ${{ secrets.SERVER_DEPLOY_PATH }}/app.log 2>&1 &
+            # 验证
             sleep 5
-            NEW_PID=$(ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep | awk '{print $2}')
-            if [ -z "$NEW_PID" ]; then
-              echo "❌ Service start failed! Logs:"
+            if ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep; then
+              echo "✅ Service Started!"
+            else
               cat ${{ secrets.SERVER_DEPLOY_PATH }}/app.log
               exit 1
-            else
-              echo "✅ Service started successfully! PID: $NEW_PID"
             fi
