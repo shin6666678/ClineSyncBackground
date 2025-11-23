@@ -12,9 +12,11 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # 1. 拉取代码
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2. 设置 JDK 环境
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -22,11 +24,12 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
+      # 3. Maven 打包
       - name: Build with Maven
         run: mvn clean package -DskipTests
 
-      # 测试SSH连接（关键：先验证连接）
-      - name: Test SSH Connection
+      # 4. 测试 SSH 连接并准备目录
+      - name: Test SSH Connection & Prepare Dir
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -36,19 +39,25 @@ jobs:
           script: |
             echo "✅ SSH Connection Success!"
             echo "Server Path: ${{ secrets.SERVER_DEPLOY_PATH }}"
+            # 确保目录存在
             mkdir -p ${{ secrets.SERVER_DEPLOY_PATH }}/temp
-            chmod -R 777 ${{ secrets.SERVER_DEPLOY_PATH }}
+            # 赋予权限 (视情况而定，如果是 root 用户可能不需要 777)
+            chmod -R 755 ${{ secrets.SERVER_DEPLOY_PATH }}
 
-      # 用SSH原生命令传输JAR包（替代第三方Action）
+      # 5. 上传 JAR 包 (使用原生 scp)
       - name: Upload JAR via SSH
         run: |
-          # 将私钥写入临时文件
+          echo "📝 Creating temporary SSH key..."
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/id_rsa_github
           chmod 600 /tmp/id_rsa_github
-          # 用scp传输（指定私钥文件）
+          
+          echo "🚀 Uploading JAR to server..."
           scp -i /tmp/id_rsa_github -o StrictHostKeyChecking=no target/*.jar ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/temp/
+          
+          echo "🧹 Cleaning up temporary key..."
+          rm /tmp/id_rsa_github
 
-      # 部署服务
+      # 6. 远程部署 (停止旧服务 -> 移动新包 -> 启动 -> 验证)
       - name: Deploy Service
         uses: appleboy/ssh-action@master
         with:
@@ -57,17 +66,69 @@ jobs:
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            # 停止旧服务
-            PID=$(ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep | awk '{print $2}')
-            if [ -n "$PID" ]; then kill $PID || true; sleep 3; fi
-            # 启动新服务
-            mv -f ${{ secrets.SERVER_DEPLOY_PATH }}/temp/*.jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar
-            nohup java -jar ${{ secrets.SERVER_DEPLOY_PATH }}/ClineSyncBackground.jar > ${{ secrets.SERVER_DEPLOY_PATH }}/app.log 2>&1 &
-            # 验证
-            sleep 5
-            if ps -ef | grep 'ClineSyncBackground.jar' | grep -v grep; then
-              echo "✅ Service Started!"
+            # === 配置变量 ===
+            APP_NAME="ClineSyncBackground.jar"
+            DEPLOY_PATH="${{ secrets.SERVER_DEPLOY_PATH }}"
+            LOG_FILE="$DEPLOY_PATH/app.log"
+
+            echo "📂 Navigate to: $DEPLOY_PATH"
+            cd $DEPLOY_PATH
+
+            # === 1. 停止旧服务 (优化版) ===
+            echo "🛑 Checking for existing process..."
+            PID=$(ps -ef | grep "$APP_NAME" | grep -v grep | awk '{print $2}')
+            
+            if [ -n "$PID" ]; then
+              echo "Process found (PID: $PID). Stopping..."
+              kill $PID
+            
+              # 循环等待进程结束 (最多等待 20秒)
+              for i in {1..20}; do
+                if ! ps -p $PID > /dev/null; then
+                  echo "✅ Process stopped successfully."
+                  break
+                fi
+                echo "Waiting for process to exit... ($i/20)"
+                sleep 1
+              done
+            
+              # 如果还在运行，强制杀死
+              if ps -p $PID > /dev/null; then
+                echo "⚠️ Force killing process..."
+                kill -9 $PID
+              fi
             else
-              cat ${{ secrets.SERVER_DEPLOY_PATH }}/app.log
+              echo "✅ No running process found."
+            fi
+
+            # === 2. 移动新 JAR 包 ===
+            echo "📦 Moving new JAR file..."
+            # 强制覆盖旧文件
+            if ls $DEPLOY_PATH/temp/*.jar 1> /dev/null 2>&1; then
+                mv -f $DEPLOY_PATH/temp/*.jar $DEPLOY_PATH/$APP_NAME
+            else
+                echo "❌ Error: No JAR file found in temp directory!"
+                exit 1
+            fi
+
+            # === 3. 启动新服务 ===
+            echo "🚀 Starting new application..."
+            # 使用 nohup 后台启动
+            nohup java -jar $DEPLOY_PATH/$APP_NAME > $LOG_FILE 2>&1 &
+
+            # === 4. 健康检查 ===
+            echo "🏥 Health checking..."
+            sleep 10  # 等待 Spring Boot 初始化
+            
+            NEW_PID=$(ps -ef | grep "$APP_NAME" | grep -v grep | awk '{print $2}')
+            
+            if [ -n "$NEW_PID" ]; then
+              echo "✅ Deployment Successful! Process ID: $NEW_PID"
+              echo "📋 Tail of the log:"
+              tail -n 20 $LOG_FILE
+            else
+              echo "❌ Deployment Failed! Process not running."
+              echo "📋 Full log content:"
+              cat $LOG_FILE
               exit 1
             fi
